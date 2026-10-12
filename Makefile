@@ -7,7 +7,7 @@
 # app's self-test needs a build: make app && python3 tools/check_app.py build/Sequent.app
 test:
 	@python3 tools/check_app.py helper/linux/sequent
-	@npm test --silent
+	@python3 -m unittest discover -s tests
 
 # Sequent.app, the CDJ connection as a Mac menu-bar app (helper/mac), built
 # for Apple silicon and Intel with the command-line tools; no Xcode needed.
@@ -69,4 +69,4 @@ deb:
 record:
 	@tools/djlink-record.sh $(or $(NAME),$(shell date +%Y-%m-%d-%H%M)) $(or $(SECONDS),120)
 replay:
-	@node tools/djlink-replay.mjs $(or $(FILE),two-decks-2026-10-08) $(if $(LOOP),--loop)
+	@python3 tools/djlink_replay.py $(or $(FILE),two-decks-2026-10-08) $(if $(LOOP),--loop)

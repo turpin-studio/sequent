@@ -12,6 +12,9 @@ on:
     paths:
       - "helper/linux/**"
       - "tools/build_deb.py"
+      - "tools/djlink_replay.py"
+      - "tests/**"
+      - "Makefile"
       - "tools/check_app.py"
       - "tools/check_linux.sh"
       - "tools/fixtures/**"
@@ -33,6 +36,7 @@ jobs:
           fetch-depth: 0   # the commit count is the development build number
       - id: build
         run: |
+          make test
           make deb
           echo "version=0.0.0-dev.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4

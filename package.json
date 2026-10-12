@@ -1,9 +1,0 @@
-{
-  "name": "sequent",
-  "private": true,
-  "type": "module",
-  "license": "EPL-2.0",
-  "scripts": {
-    "test": "node --test \"tests/*.test.js\""
-  }
-}

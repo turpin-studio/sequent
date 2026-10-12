@@ -1,6 +1,6 @@
 #!/bin/sh
 # Record the CDJs' Pro DJ Link traffic, to play back later with
-# tools/djlink-replay.mjs and test the page with no decks (make record).
+# tools/djlink_replay.py and test the page with no decks (make record).
 #
 #   tools/djlink-record.sh NAME [SECONDS]
 #
