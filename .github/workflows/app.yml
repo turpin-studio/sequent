@@ -1,0 +1,223 @@
+# Sequent.app, built and checked on GitHub's macOS runners rather than on
+# anybody's own Mac, so a release is exactly what this repository holds.
+#
+# Every change to the app's code builds it and checks it: universal, signed,
+# and decoding captured CDJ packets as expected. Signed with the Developer ID
+# and notarised by Apple when the repository holds the secrets for it:
+#
+#   MACOS_CERTIFICATE           the Developer ID Application .p12, base64
+#   MACOS_CERTIFICATE_PASSWORD  the password it was exported with
+#   NOTARY_KEY_ID, NOTARY_ISSUER_ID, NOTARY_KEY
+#                               an App Store Connect API key, the .p8's text
+#
+# Until all of them are there it signs ad hoc, as before, and says so. A tag
+# app-v<version> also publishes it as a GitHub release, its version taken from
+# the tag, which is where it is downloaded from and where the app looks for
+# updates. It runs only when the app could have changed.
+name: Sequent.app
+
+on:
+  push:
+    branches: [main]
+    tags: ["app-v*"]
+    paths:
+      - "helper/mac/**"
+      - "tools/check_app.py"
+      - "tools/fixtures/**"
+      - "Makefile"
+      - "tools/check_dmg.sh"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40   # notarising waits on Apple, usually minutes
+    env:
+      SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.NOTARY_KEY != '' && secrets.NOTARY_ISSUER_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the whole history, for the build number
+
+      - name: Version
+        id: version
+        run: |
+          # A tag app-v1.2.0 releases 1.2.0; anything else is a numbered
+          # development build of the next release.
+          # Any other tag would make a release the app's update check can't
+          # compare, so it stops here.
+          if [[ "$GITHUB_REF" == refs/tags/app-v* ]]; then
+            v="${GITHUB_REF#refs/tags/app-v}"
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag $GITHUB_REF_NAME isn't app-vX.Y.Z"; exit 1; }
+            # Every release has notes, which become the GitHub release's text.
+            jq -e --arg v "$v" 'any(.[]; .version == $v and (.notes | length > 0))' helper/releases.json >/dev/null \
+              || { echo "::error::no release notes for $v in helper/releases.json"; exit 1; }
+            echo "app=$v" >> "$GITHUB_OUTPUT"
+            echo "name=$v" >> "$GITHUB_OUTPUT"
+          else
+            # macOS takes at most three integers, so the count goes in the
+            # build number and the file name, not the version.
+            echo "app=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "name=0.0.0-dev.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Into a keychain of its own, made for this run and gone with the runner.
+      - name: Signing identity
+        id: identity
+        if: env.SIGNED == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          pass=$(openssl rand -hex 16)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pass" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          id=$(security find-identity -v -p codesigning "$keychain" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+          [ -n "$id" ] || { echo "::error::no Developer ID Application identity in the certificate"; exit 1; }
+          echo "sign=$id" >> "$GITHUB_OUTPUT"
+          echo "Signing as $id"
+
+      - name: Notary key
+        if: env.SIGNED == 'true'
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+        run: printf '%s\n' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+
+      - name: Build
+        run: make app APP_VERSION="${{ steps.version.outputs.app }}" SIGN="${{ steps.identity.outputs.sign || '-' }}"
+
+      - name: Check the build
+        run: |
+          lipo -archs build/Sequent.app/Contents/MacOS/Sequent | tr ' ' '\n' | sort | tr '\n' ' ' | grep -q "arm64 x86_64"
+          codesign --verify --deep --strict build/Sequent.app
+          if [ "$SIGNED" = true ]; then
+            codesign -dv build/Sequent.app 2>&1 | grep -q 'flags=.*runtime' || { echo "::error::no hardened runtime"; exit 1; }
+          else
+            echo "::warning::signed ad hoc: no Developer ID secrets, so not notarised"
+          fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" build/Sequent.app/Contents/Info.plist
+
+      - name: Check the app reads the CDJs as it should
+        run: python3 tools/check_app.py build/Sequent.app
+
+      # The app first, so its ticket is stapled to it and travels in the disk
+      # image, and it opens offline the first time. (The notary service takes
+      # a zip, which goes no further.)
+      # Stapling and validating fetch the ticket from Apple's CloudKit, which
+      # drops the connection now and then ("The network connection was lost",
+      # error 68) after notarising has already succeeded, so those calls are
+      # tried up to five times (retry, staple).
+      - name: Notarise the app
+        if: env.SIGNED == 'true'
+        run: |
+          retry() { for i in 1 2 3 4 5; do "$@" && return; echo "::warning::$1 failed, try $i of 5"; sleep 20; done; return 1; }
+          staple() { retry xcrun stapler staple "$1"; }
+          ditto -c -k --keepParent build/Sequent.app build/notarise.zip
+          xcrun notarytool submit build/notarise.zip --wait --timeout 30m \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "${{ secrets.NOTARY_KEY_ID }}" --issuer "${{ secrets.NOTARY_ISSUER_ID }}"
+          staple build/Sequent.app
+          rm build/notarise.zip
+
+      - name: Disk image
+        run: |
+          # dmgbuild, pinned, in a throwaway environment, with the system Python.
+          /usr/bin/python3 -m venv build/venv
+          build/venv/bin/pip install -q dmgbuild==1.6.5
+          make image DMGBUILD=build/venv/bin/dmgbuild SIGN="${{ steps.identity.outputs.sign || '-' }}"
+
+      - name: Notarise the disk image
+        if: env.SIGNED == 'true'
+        run: |
+          retry() { for i in 1 2 3 4 5; do "$@" && return; echo "::warning::$1 failed, try $i of 5"; sleep 20; done; return 1; }
+          staple() { retry xcrun stapler staple "$1"; }
+          xcrun notarytool submit build/Sequent.dmg --wait --timeout 30m \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "${{ secrets.NOTARY_KEY_ID }}" --issuer "${{ secrets.NOTARY_ISSUER_ID }}"
+          staple build/Sequent.dmg
+
+      # What Gatekeeper will say to a download, asked here rather than found
+      # out on someone's Mac.
+      - name: Check Gatekeeper accepts it
+        if: env.SIGNED == 'true'
+        run: |
+          retry() { for i in 1 2 3 4 5; do "$@" && return; echo "::warning::$1 failed, try $i of 5"; sleep 20; done; return 1; }
+          staple() { retry xcrun stapler staple "$1"; }
+          retry xcrun stapler validate build/Sequent.app
+          retry xcrun stapler validate build/Sequent.dmg
+          spctl --assess --type execute -vv build/Sequent.app
+          spctl --assess --type open --context context:primary-signature -vv build/Sequent.dmg
+
+      - name: Check the disk image
+        run: tools/check_dmg.sh build/Sequent.dmg
+
+      - name: Package
+        run: |
+          v="${{ steps.version.outputs.name }}"
+          # The disk image is the only download: the drag into Applications
+          # is the install, and a zip only invited running it from Downloads.
+          mv build/Sequent.dmg "build/Sequent-$v.dmg"
+          cd build
+          shasum -a 256 "Sequent-$v.dmg" > "Sequent-$v.dmg.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sequent-${{ steps.version.outputs.name }}
+          path: |
+            build/Sequent-*.dmg
+            build/Sequent-*.sha256
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/app-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to publish the release, and nothing else
+    env:
+      SIGNED: ${{ secrets.MACOS_CERTIFICATE != '' && secrets.NOTARY_KEY != '' && secrets.NOTARY_ISSUER_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: helper/releases.json
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # The GitHub release is the download: a disk image with the same name
+      # in every release, so .../releases/latest/download/Sequent.dmg always
+      # works, its checksum, and latest.json, which the app checks for updates.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF#refs/tags/app-v}"
+          cd dist
+          mv "Sequent-$version.dmg" Sequent.dmg
+          rm "Sequent-$version.dmg.sha256"
+          shasum -a 256 Sequent.dmg > Sequent.dmg.sha256
+          printf '{"version":"%s","dmg":"Sequent.dmg","dmg_sha256":"%s","url":"https://github.com/%s/releases/download/%s/Sequent.dmg"}\n' \
+            "$version" "$(cut -d' ' -f1 Sequent.dmg.sha256)" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > latest.json
+          cd ..
+          # This release's notes, from helper/releases.json.
+          notes=$(jq -r --arg v "$version" '.[] | select(.version == $v) | .notes[] | "- " + .' helper/releases.json)
+          notes="$notes"$'\n\n'"Built and checked by the pipeline from ${GITHUB_SHA::7}. Open Sequent.dmg and drag Sequent into Applications."
+          if [ "$SIGNED" = true ]; then
+            notes="$notes Signed and notarised by Apple, so it opens like any downloaded app."
+          else
+            notes="$notes Not notarised, so the first time macOS says it could not be verified: choose Done, then System Settings, Privacy and Security, Open Anyway."
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/Sequent.dmg dist/Sequent.dmg.sha256 dist/latest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Sequent $version" \
+            --notes "$notes"

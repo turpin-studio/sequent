@@ -1,0 +1,721 @@
+#!/usr/bin/python3
+"""Sequent: the Pro DJ Link connection for Linux, in the tray.
+
+The Linux counterpart of Sequent.app (helper/mac/main.swift), doing the same
+job the same way: it listens for the CDJs' broadcasts, announces itself as
+player 7 on each link-local network so the players send their status, asks a
+deck's database for a rekordbox track's title and artist, and serves it all
+to the Sequent page over a WebSocket on 127.0.0.1:8795, accepting only
+turpin.studio and localhost. The page's messages are the app's, byte for
+byte where it matters: `--selftest` must reproduce
+tools/fixtures/selftest.expected, as the Mac app's does.
+
+It never sends the players anything that changes what they do.
+
+Python and the standard library for the work, so one package runs on any
+Debian or Ubuntu machine whatever its processor; GTK and Ayatana
+AppIndicator for the tray icon when they're there, and without them (or with
+--headless) it runs in the terminal and says what it sees.
+
+    sequent                  the tray icon
+    sequent --headless       no icon, a line on standard error per change
+    sequent --listen-only    announce nothing: beats only, no status
+    sequent --selftest PORT:FILE...   decode captured packets and exit
+"""
+
+import asyncio
+import base64
+import hashlib
+import json
+import math
+import os
+import pathlib
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# Stamped by the package build; a build that isn't a release says 0.0.0.
+VERSION = "0.0.0"
+
+MAGIC = b"Qspt1WmJOL"
+# SEQUENT_PORT_OFFSET moves the Pro DJ Link ports, only so a test copy can run
+# beside a real one; with it set, no CDJ will hear or be heard.
+PORT_OFFSET = int(os.environ.get("SEQUENT_PORT_OFFSET") or 0)
+ANNOUNCE_PORT, BEAT_PORT, STATUS_PORT = 50000 + PORT_OFFSET, 50001 + PORT_OFFSET, 50002 + PORT_OFFSET
+DB_PORT = 12523
+VIRTUAL_PLAYER = 7
+WS_HOST, WS_PORT = "127.0.0.1", int(os.environ.get("SEQUENT_WS_PORT") or 8795)
+ORIGINS = ("https://turpin.studio", "http://localhost", "http://127.0.0.1")
+SITE = "https://turpin.studio/"
+RESEARCH = "https://djl-analysis.deepsymmetry.org/"
+ANNOUNCE_EVERY_S = 1.5
+LINKS_EVERY_S = 10
+DUPLICATE_WINDOW_S = 0.05   # each packet arrives once per USB link
+DB_TIMEOUT_S = 4
+DB_LARGEST = 1 << 20        # no field from a deck's database is bigger than this
+
+
+def log(text):
+    print(f"Sequent: {text}", file=sys.stderr, flush=True)
+
+
+# Decoding: the layouts of Deep Symmetry's DJ Link packet analysis.
+
+def text(p, start, end):
+    return p[start:end].split(b"\0")[0].decode("utf-8", "replace").strip()
+
+
+def u16(p, at):
+    return int.from_bytes(p[at:at + 2], "big")
+
+
+def u32(p, at):
+    return int.from_bytes(p[at:at + 4], "big")
+
+
+def rounded(x):
+    """Half away from zero, as Swift's .rounded(), so both apps agree."""
+    return math.copysign(math.floor(abs(x) + 0.5), x)
+
+
+def round2(x):
+    return rounded(x * 100) / 100
+
+
+FLAT = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def status_key(p):
+    """The key a CDJ-3000 or 3000X is playing in, such as "Bbm", from its own
+    status packet, or None. At 0x15c the key as a note (minor keys counted up
+    from A, major from C), then 0 minor or 1 major, then the accidental (0xff
+    flat); at 0x164 the Key Shift in cents, signed. The key heard is the key
+    moved by the shift. See statusKey() in the Mac app."""
+    if len(p) < 0x16c or p[0x15c] >= 12 or p[0x15d] > 1:
+        return None
+    cents = int.from_bytes(p[0x164:0x16c], "big", signed=True)
+    minor = p[0x15d] == 0
+    note = p[0x15c] + (9 if minor else 0) + int(rounded(cents / 100))
+    return (FLAT if p[0x15e] == 0xff else SHARP)[note % 12] + ("m" if minor else "")
+
+
+def parse(port, p):
+    """A Pro DJ Link packet as the page gets it, or None if it isn't one."""
+    if len(p) < 0x22 or not p.startswith(MAGIC):
+        return None
+    kind = p[0x0a]
+    if port == ANNOUNCE_PORT and kind == 0x06 and len(p) >= 0x30:
+        return {"type": "device", "name": text(p, 0x0c, 0x20), "number": p[0x24],
+                "ip": ".".join(str(b) for b in p[0x2c:0x30])}
+    if port == BEAT_PORT and kind == 0x28 and len(p) >= 0x60:
+        pitch = (u32(p, 0x54) - 0x100000) / 0x100000 * 100
+        bpm = u16(p, 0x5a) / 100
+        return {"type": "beat", "name": text(p, 0x0b, 0x1f), "number": p[0x21], "bpm": bpm,
+                "pitch": round2(pitch), "tempo": round2(bpm * (1 + pitch / 100)), "beat": p[0x5c],
+                "nextBeatMs": u32(p, 0x24), "nextBarMs": u32(p, 0x2c)}
+    if port == STATUS_PORT and kind == 0x0a and len(p) >= 0xd0:
+        flags, bpm = p[0x89], u16(p, 0x92)
+        pitch = (u32(p, 0x8c) - 0x100000) / 0x100000 * 100
+        m = {"type": "status", "name": text(p, 0x0b, 0x1f), "number": p[0x21],
+             "firmware": text(p, 0x7c, 0x80),
+             "source": p[0x28], "slot": p[0x29], "trackType": p[0x2a],
+             "rekordboxId": u32(p, 0x2c), "trackNumber": u16(p, 0x32),
+             "playing": bool(flags & 0x40), "master": bool(flags & 0x20),
+             "sync": bool(flags & 0x10), "onAir": bool(flags & 0x08),
+             "bpm": None if bpm == 0xffff else bpm / 100, "pitch": round2(pitch)}
+        key = status_key(p)
+        if key and bpm != 0xffff:
+            m["key"] = key
+        return m
+    if port == BEAT_PORT and kind in (0x26, 0x27):
+        return {"type": "master", "kind": "request" if kind == 0x26 else "response", "number": p[0x21]}
+    return {"type": "other", "port": port, "kind": kind, "number": p[0x21]}
+
+
+def as_json(m):
+    return json.dumps(m, sort_keys=True, separators=(",", ":"))
+
+
+def announcement(number, ip, mac):
+    """The announcement that we are a player, as beat-link sends it."""
+    return (MAGIC + bytes([0x06, 0x00]) + b"sequent".ljust(20, b"\0")
+            + bytes([0x01, 0x02, 0x00, 0x36, number, 0x01]) + bytes(mac) + bytes(ip)
+            + bytes([0x01, 0x00, 0x00, 0x00, 0x01, 0x00]))
+
+
+# The links: our address and MAC on each link-local interface. Each CDJ's USB
+# cable is a network of its own, so we announce on every one.
+
+def links():
+    """[(interface, ip bytes, mac bytes)], from iproute2's JSON."""
+    try:
+        out = subprocess.run(["ip", "-j", "addr", "show"], capture_output=True, text=True, timeout=5).stdout
+        interfaces = json.loads(out or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    found = []
+    for i in interfaces:
+        mac = i.get("address", "")
+        if len(mac) != 17 or i.get("link_type") not in ("ether", None):
+            continue
+        for a in i.get("addr_info", []):
+            if a.get("family") == "inet" and a.get("local", "").startswith("169.254."):
+                found.append((i["ifname"], socket.inet_aton(a["local"]), bytes.fromhex(mac.replace(":", ""))))
+    return sorted(found)
+
+
+# The deck's database: a rekordbox track's title, artist and key.
+
+DB_MAGIC, DB_SETUP_TX = 0x872349ae, 0xfffffffe
+LABELS = {0x04: "title", 0x07: "artist", 0x02: "album", 0x0f: "key"}
+
+
+def number(n, size=4):
+    return {1: b"\x0f", 2: b"\x10", 4: b"\x11"}[size] + (n & ((1 << (8 * size)) - 1)).to_bytes(size, "big")
+
+
+def db_message(tx, kind, args):
+    tags = bytes([0x06] * len(args)).ljust(12, b"\0")
+    return (number(DB_MAGIC) + number(tx) + number(kind, 2) + number(len(args), 1)
+            + b"\x14\x00\x00\x00\x0c" + tags + b"".join(number(a) for a in args))
+
+
+async def field(r):
+    tag = (await r.readexactly(1))[0]
+    if tag in (0x0f, 0x10, 0x11):
+        return int.from_bytes(await r.readexactly({0x0f: 1, 0x10: 2, 0x11: 4}[tag]), "big")
+    if tag not in (0x14, 0x26):
+        raise ValueError(f"unknown field type {tag:#x}")
+    size = int.from_bytes(await r.readexactly(4), "big") * (2 if tag == 0x26 else 1)
+    if size > DB_LARGEST:
+        raise ValueError("field too large")
+    raw = await r.readexactly(size) if size else b""
+    return raw if tag == 0x14 else raw.decode("utf-16-be", "replace").strip("\0")
+
+
+async def db_response(r):
+    if await field(r) != DB_MAGIC:
+        raise ValueError("not a database server message")
+    await field(r)
+    kind, count = await field(r), await field(r)
+    await field(r)
+    return kind, [await field(r) for _ in range(count)]
+
+
+async def metadata(ip, slot, rid, posing, local):
+    """Posing as a real player number, 1 to 4, which players answer."""
+    bind = (socket.inet_ntoa(local), 0) if local else None
+    r, w = await asyncio.open_connection(ip, DB_PORT, local_addr=bind)
+    w.write(b"\x00\x00\x00\x0fRemoteDBServer\x00")
+    port = int.from_bytes(await r.readexactly(2), "big")
+    w.close()
+    r, w = await asyncio.open_connection(ip, port, local_addr=bind)
+    try:
+        w.write(number(1))
+        await r.readexactly(5)
+        w.write(db_message(DB_SETUP_TX, 0x0000, [posing]))
+        await db_response(r)
+        dmst = posing << 24 | 1 << 16 | slot << 8 | 1
+        w.write(db_message(1, 0x2002, [dmst, rid]))
+        _, args = await db_response(r)
+        count = args[1] if len(args) > 1 and isinstance(args[1], int) else 0
+        w.write(db_message(2, 0x3000, [dmst, 0, count, 0, count, 0]))
+        found = {}
+        while True:
+            kind, args = await db_response(r)
+            if kind == 0x4101 and len(args) > 6 and isinstance(args[6], int) and isinstance(args[3], str):
+                label = LABELS.get(args[6] & 0xff)
+                if label and args[3]:
+                    found[label] = args[3]
+            if kind not in (0x4101, 0x4001):
+                break
+        w.write(db_message(DB_SETUP_TX, 0x0100, []))
+        return found
+    finally:
+        w.close()
+
+
+# The WebSocket, just enough of it: the page never sends anything but a close.
+
+def accept_key(key):
+    return base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+
+
+def frame(data, opcode=0x1):
+    n = len(data)
+    head = bytes([0x80 | opcode])
+    head += bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else bytes([127]) + struct.pack(">Q", n)
+    return head + data
+
+
+# Any app on a turpin.studio subdomain over https, such as midi.turpin.studio:
+# one or more DNS labels of letters, digits and inner hyphens.
+SUBDOMAIN = re.compile(r"https://([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+turpin\.studio")
+
+
+def allowed(origin):
+    """The pages that may connect: those in ORIGINS, on any port, and any
+    turpin.studio subdomain over https, since only the studio can create
+    those. Nothing else, so another site can't read what is playing."""
+    return any(origin == o or origin.startswith(o + ":") for o in ORIGINS) or bool(SUBDOMAIN.fullmatch(origin))
+
+
+# The helper: UDP in, WebSocket out. Everything runs on one asyncio loop, so
+# its state needs no locking; the tray reads only the snapshots it's handed.
+
+class Helper:
+    def __init__(self, listen_only=False, on_change=lambda snapshot: None):
+        self.listen_only = listen_only
+        self.on_change = on_change
+        self.devices, self.announced, self.statuses, self.tracks = {}, {}, {}, {}
+        self.beats, self.seen = {}, {}
+        self.transports = {}
+        self.blocked = False
+        self.link_list, self.senders = [], []
+        self.clients = set()
+        self.loop = None
+        self.shown = None
+        self.busy = None   # made on the helper's own loop, as Python 3.9 needs
+
+    async def run(self):
+        self.loop = asyncio.get_running_loop()
+        await self.bind_ports()
+        try:
+            await asyncio.start_server(self.websocket, WS_HOST, WS_PORT)
+            log(f"WebSocket on {WS_HOST}:{WS_PORT}")
+        except OSError as e:
+            log(f"can't listen on {WS_PORT}: {e.strerror}")
+        self.refresh_links()
+        last_links = time.monotonic()
+        while True:
+            await asyncio.sleep(ANNOUNCE_EVERY_S)
+            if self.blocked:
+                await self.bind_ports()
+            if time.monotonic() - last_links >= LINKS_EVERY_S:
+                self.refresh_links()
+                last_links = time.monotonic()
+            self.announce()
+
+    async def bind_ports(self):
+        ports = (ANNOUNCE_PORT, BEAT_PORT) if self.listen_only else (ANNOUNCE_PORT, BEAT_PORT, STATUS_PORT)
+        failed = False
+        for port in ports:
+            if port in self.transports:
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                s.close()
+                failed = True
+                continue
+            transport, _ = await self.loop.create_datagram_endpoint(lambda port=port: Listener(self, port), sock=s)
+            self.transports[port] = transport
+        if self.blocked != failed:
+            self.blocked = failed
+            log("the CDJs' ports are taken" if failed else "listening for the CDJs")
+            self.changed()
+
+    def refresh_links(self):
+        now = links()
+        if now == self.link_list:
+            return
+        for s, _ in self.senders:
+            s.close()
+        self.senders = []
+        for name, ip, mac in now:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            # Out of this interface, whatever the routing table says: two USB
+            # links are two networks with the same addresses. Linux allows it
+            # unprivileged since 5.7; binding to the address is the fallback.
+            try:
+                s.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_BINDTODEVICE", 25), name.encode())
+            except OSError:
+                pass
+            try:
+                s.bind((socket.inet_ntoa(ip), 0))
+            except OSError:
+                s.close()
+                continue
+            self.senders.append((s, announcement(VIRTUAL_PLAYER, ip, mac)))
+        self.link_list = now
+        log("links: " + (", ".join(f"{n} {socket.inet_ntoa(ip)}" for n, ip, _ in now) or "none"))
+        self.changed()
+
+    def announce(self):
+        """Say we are here on every link, so the players send us their status."""
+        if self.listen_only:
+            return
+        for s, packet in self.senders:
+            try:
+                s.sendto(packet, ("169.254.255.255", ANNOUNCE_PORT))
+            except OSError:
+                pass
+
+    def receive(self, port, packet, addr):
+        now = time.time()
+        # Each packet arrives once per USB link: drop the copy seen moments ago.
+        self.seen = {k: t for k, t in self.seen.items() if now - t < DUPLICATE_WINDOW_S}
+        if packet in self.seen:
+            return
+        self.seen[packet] = now
+        msg = parse(port, packet)
+        if not msg:
+            return
+        msg["t"] = round(now * 1000)
+        msg["from"] = addr[0]
+        n = msg.get("number", 0)
+        if msg["type"] == "device":
+            known = self.devices.get(n)
+            self.devices[n] = msg
+            if known and known["name"] == msg["name"] and now - self.announced.get(n, 0) < 4:
+                return
+            self.announced[n] = now
+            self.changed()
+        if msg["type"] == "status" and not self.status_changed(msg, now):
+            return
+        if msg["type"] == "beat":
+            self.beats[n] = (msg["tempo"], now)
+        self.broadcast(msg)
+
+    def status_changed(self, msg, now):
+        """Status arrives several times a second: pass on changes, and
+        otherwise one a second; and look up a rekordbox track's details once."""
+        n = msg["number"]
+        if msg["rekordboxId"] and msg["trackType"] == 1:
+            key = (msg["source"], msg["slot"], msg["rekordboxId"])
+            if key in self.tracks:
+                merge(msg, self.tracks[key])
+            else:
+                self.tracks[key] = {}
+                self.loop.create_task(self.look_up(key))
+        strip = lambda m: {k: v for k, v in m.items() if k not in ("t", "from")}
+        sent, when = self.statuses.get(n, (None, 0))
+        same = sent is not None and strip(sent) == strip(msg)
+        if same and now - when < 1:
+            return False
+        self.statuses[n] = (msg, now)
+        if not same:
+            self.changed()
+        return True
+
+    async def look_up(self, key):
+        source, slot, rid = key
+        device = self.devices.get(source)
+        if not device:
+            return
+        posing = next((n for n in sorted(self.devices) if 1 <= n <= 4 and n != source),
+                      next(n for n in (1, 2, 3, 4) if n != source))
+        found = {}
+        for local in [ip for _, ip, _ in self.link_list] or [None]:
+            try:
+                found = await asyncio.wait_for(metadata(device["ip"], slot, rid, posing, local), DB_TIMEOUT_S)
+                break
+            except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                continue
+        self.tracks[key] = found
+        for n, (sent, _) in list(self.statuses.items()):
+            if (sent["source"], sent["slot"], sent["rekordboxId"]) == key:
+                m = merge(dict(sent), found)
+                m["t"] = round(time.time() * 1000)
+                self.statuses[n] = (m, time.time())
+                self.broadcast(m)
+        self.changed()
+
+    async def websocket(self, reader, writer):
+        try:
+            request = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)).decode("latin-1")
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
+            writer.close()
+            return
+        headers = {k.strip().lower(): v.strip() for k, _, v in (line.partition(":") for line in request.split("\r\n")[1:]) if k}
+        # Only pages from turpin.studio and this computer may connect.
+        if headers.get("upgrade", "").lower() != "websocket" or "sec-websocket-key" not in headers or not allowed(headers.get("origin", "")):
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            writer.close()
+            return
+        writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                      f"Sec-WebSocket-Accept: {accept_key(headers['sec-websocket-key'])}\r\n\r\n").encode())
+        # Its version and platform too: the page offers the Mac download only
+        # to the Mac app.
+        writer.write(frame(as_json({"type": "hello", "version": VERSION, "platform": "linux",
+                                    "devices": list(self.devices.values()),
+                                    "statuses": [s for s, _ in self.statuses.values()]}).encode()))
+        self.clients.add(writer)
+        self.changed()
+        try:
+            # The page never needs to say anything; reading notices it leave.
+            while True:
+                head = await reader.readexactly(2)
+                n = head[1] & 0x7f
+                n = int.from_bytes(await reader.readexactly(2 if n == 126 else 8), "big") if n >= 126 else n
+                if n > DB_LARGEST:
+                    break
+                await reader.readexactly((4 if head[1] & 0x80 else 0) + n)
+                if head[0] & 0x0f == 0x8:
+                    writer.write(frame(b"", 0x8))
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        self.clients.discard(writer)
+        writer.close()
+        self.changed()
+
+    def broadcast(self, m):
+        data = frame(as_json(m).encode())
+        for w in list(self.clients):
+            if w.is_closing():
+                self.clients.discard(w)
+            else:
+                w.write(data)
+
+    # For the tray.
+
+    def tempo(self):
+        """The master deck's tempo while it beats, else any deck beating;
+        none once the decks have been quiet for two seconds."""
+        now = time.time()
+        live = {n: t for n, (t, at) in self.beats.items() if now - at < 2}
+        master = next((n for n, (s, _) in self.statuses.items() if s.get("master")), None)
+        if master in live:
+            return live[master]
+        return live[min(live)] if live else None
+
+    def players(self):
+        now = time.time()
+        return sorted((d for d in self.devices.values() if d["number"] <= 6 and now - d["t"] / 1000 < 10), key=lambda d: d["number"])
+
+    def line(self, d):
+        n = d["number"]
+        parts = [f"Deck {n}"]
+        if n in self.statuses:
+            s = self.statuses[n][0]
+            if s.get("bpm") is not None:
+                parts.append(f"{s['bpm'] * (1 + s.get('pitch', 0) / 100):.2f} BPM")
+            parts.append("playing" if s.get("playing") else "stopped")
+            if s.get("master"):
+                parts.append("master")
+            if s.get("title"):
+                parts.append(s["title"] + (f" — {s['artist']}" if s.get("artist") else ""))
+        return " · ".join(parts)
+
+    def status(self):
+        if self.blocked:
+            return "Another copy of Sequent, or its service, holds the CDJs' ports: stop it to connect"
+        n = len(self.players())
+        if not self.link_list and n == 0:
+            return "Looking for CDJs: connect one by USB or network"
+        return "Listening; no CDJs seen yet" if n == 0 else f"{n} CDJ{'' if n == 1 else 's'} found"
+
+    def snapshot(self):
+        tempo = self.tempo()
+        return {"blocked": self.blocked, "found": bool(self.players()), "status": self.status(),
+                "decks": [self.line(d) for d in self.players()], "pages": len(self.clients),
+                "tempo": None if tempo is None else f"{tempo:.1f}"}
+
+    def changed(self):
+        """Hands the tray a snapshot, only when what it shows has changed."""
+        snapshot = self.snapshot()
+        if snapshot != self.shown:
+            self.shown = snapshot
+            self.on_change(snapshot)
+        if self.busy:
+            self.busy.set() if snapshot["tempo"] or snapshot["decks"] else self.busy.clear()
+
+
+def merge(msg, found):
+    """A track's looked-up details into a status, keeping the deck's own key."""
+    for k, v in found.items():
+        if k != "key" or "key" not in msg:
+            msg[k] = v
+    return msg
+
+
+class Listener(asyncio.DatagramProtocol):
+    def __init__(self, helper, port):
+        self.helper, self.port = helper, port
+
+    def datagram_received(self, data, addr):
+        self.helper.receive(self.port, data, addr)
+
+
+# The tray: GTK 3 and Ayatana AppIndicator, which GNOME (with its AppIndicator
+# extension), KDE, Cinnamon, MATE and Xfce all show.
+
+# Installed beside /usr/bin, or beside this file when run from the repository.
+HERE = pathlib.Path(__file__).resolve().parent
+ICONS = next((d for d in (HERE.parent / "share" / "sequent" / "icons", HERE / "icons") if d.is_dir()), None)
+AUTOSTART = pathlib.Path(os.environ.get("XDG_CONFIG_HOME") or pathlib.Path.home() / ".config") / "autostart" / "sequent.desktop"
+DESKTOP = pathlib.Path("/usr/share/applications/sequent.desktop")
+
+
+def tray(listen_only):
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk
+    try:
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3 as Indicator
+    except (ValueError, ImportError):
+        gi.require_version("AppIndicator3", "0.1")
+        from gi.repository import AppIndicator3 as Indicator
+
+    indicator = Indicator.Indicator.new("sequent", "sequent-waiting-symbolic", Indicator.IndicatorCategory.APPLICATION_STATUS)
+    if ICONS:
+        indicator.set_icon_theme_path(str(ICONS))
+    indicator.set_status(Indicator.IndicatorStatus.ACTIVE)
+    indicator.set_title("Sequent")
+
+    menu = Gtk.Menu()
+
+    def item(label, action=None):
+        i = Gtk.MenuItem(label=label)
+        if action:
+            i.connect("activate", lambda _: action())
+        else:
+            i.set_sensitive(False)
+        menu.append(i)
+        return i
+
+    def open_uri(uri):
+        try:
+            Gtk.show_uri_on_window(None, uri, Gtk.get_current_event_time())
+        except GLib.Error:
+            subprocess.Popen(["xdg-open", uri])
+
+    def about():
+        d = Gtk.AboutDialog(program_name="Sequent", version=VERSION, website=SITE, website_label="turpin.studio",
+                            logo_icon_name="sequent", comments="Following the CDJs is built on Deep Symmetry's DJ Link "
+                            "research, the Pro DJ Link protocol they worked out and published.")
+        d.add_credit_section("Pro DJ Link", [f"Deep Symmetry {RESEARCH}"])
+        d.run()
+        d.destroy()
+
+    header = item("")
+    decks = [item("") for _ in range(6)]
+    pages = item("")
+    menu.append(Gtk.SeparatorMenuItem())
+    item("Open Sequent", lambda: open_uri(SITE))
+    login = Gtk.CheckMenuItem(label="Start at login")
+    login.set_active(AUTOSTART.exists())
+
+    def toggle_login(i):
+        try:
+            if i.get_active():
+                AUTOSTART.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(DESKTOP, AUTOSTART)
+            else:
+                AUTOSTART.unlink(missing_ok=True)
+        except OSError as e:
+            log(f"couldn't change Start at login: {e}")
+        i.set_active(AUTOSTART.exists())
+    login.connect("toggled", toggle_login)
+    login.set_sensitive(DESKTOP.exists())
+    menu.append(login)
+    menu.append(Gtk.SeparatorMenuItem())
+    item(f"Sequent {VERSION} for Linux")
+    item("About Sequent", about)
+    item("Quit Sequent", Gtk.main_quit)
+    menu.show_all()
+    indicator.set_menu(menu)
+
+    shown = {}
+
+    def apply(s):
+        icon = "sequent-blocked-symbolic" if s["blocked"] else "sequent-found-symbolic" if s["found"] else "sequent-waiting-symbolic"
+        if shown.get("icon") != icon:
+            indicator.set_icon_full(icon, "Sequent")
+        label = f" {s['tempo']}" if s["tempo"] else ""
+        if shown.get("label") != label:
+            indicator.set_label(label, " 000.0")
+        if shown.get("status") != s["status"]:
+            header.set_label(s["status"])
+        for i, d in enumerate(decks):
+            d.set_visible(i < len(s["decks"]))
+            if i < len(s["decks"]):
+                d.set_label("   " + s["decks"][i])
+        n = s["pages"]
+        pages.set_label("No Sequent page connected" if n == 0 else f"{n} Sequent page{'' if n == 1 else 's'} connected")
+        shown.update(icon=icon, label=label, status=s["status"])
+        return False
+
+    helper = Helper(listen_only, lambda s: GLib.idle_add(apply, s))
+    apply(helper.snapshot())
+    threading.Thread(target=lambda: asyncio.run(ticking(helper)), daemon=True).start()
+    Gtk.main()
+
+
+async def ticking(helper):
+    """The helper, plus a refresh every second while there's a tempo or a deck
+    to age out, so the tempo clears when the decks stop with no packet to say
+    so. Idle, nothing changes without a packet or a new link, so it sleeps."""
+    async def tick():
+        while True:
+            await helper.busy.wait()
+            await asyncio.sleep(1)
+            helper.changed()
+    helper.busy = asyncio.Event()
+    asyncio.get_running_loop().create_task(tick())
+    await helper.run()
+
+
+def headless(listen_only):
+    last = {}
+
+    def say(s):
+        line = " · ".join([s["status"]] + s["decks"] + ([f"{s['tempo']} BPM"] if s["tempo"] else []))
+        if last.get("line") != line:
+            last["line"] = line
+            log(line)
+    try:
+        asyncio.run(ticking(Helper(listen_only, say)))
+    except KeyboardInterrupt:
+        pass
+
+
+def selftest(args):
+    """Decode each file given as port:path and print it as the page would get
+    it, then a database message and an announcement as hex, as the Mac app's
+    --selftest does, for tools/check_app.py."""
+    for arg in args:
+        port, _, path = arg.partition(":")
+        try:
+            data = pathlib.Path(path).read_bytes()
+        except OSError:
+            continue
+        m = parse(int(port), data)
+        print(as_json(m) if m else "null")
+    print(db_message(1, 0x2002, [5, 6]).hex())
+    print(announcement(7, bytes([169, 254, 38, 85]), bytes([0xc8, 0x3d, 0xfc, 0x1c, 0xe5, 0xd1])).hex())
+    # Which pages may connect, as 1 or 0 for each, the same list as the Mac's.
+    print("origins " + "".join("1" if allowed(o) else "0" for o in ["https://turpin.studio", "http://localhost:8793", "http://127.0.0.1", "https://midi.turpin.studio", "https://a.b.turpin.studio", "http://midi.turpin.studio", "https://midi.turpin.studio:8443", "https://turpin.studio.evil.com", "https://evilturpin.studio", "https://-x.turpin.studio", "http://localhost.evil.com", "null", ""]))
+
+
+def main(argv):
+    if "--selftest" in argv:
+        selftest(argv[argv.index("--selftest") + 1:])
+        return
+    if "--version" in argv:
+        print(VERSION)
+        return
+    listen_only = "--listen-only" in argv
+    log(f"{VERSION}, Pro DJ Link on ports {ANNOUNCE_PORT} to {STATUS_PORT}" + (", listening only" if listen_only else ""))
+    if "--headless" not in argv and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        try:
+            tray(listen_only)
+            return
+        except (ImportError, ValueError) as e:
+            log(f"no tray icon ({e}); install gir1.2-ayatanaappindicator3-0.1 for one. Carrying on without.")
+    headless(listen_only)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

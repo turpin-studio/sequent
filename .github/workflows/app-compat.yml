@@ -1,0 +1,78 @@
+# Sequent.app on the macOS versions GitHub has machines for: the release
+# people download, not a fresh build. On each it checks Gatekeeper accepts
+# the download, runs the self-test that decodes captured CDJ packets, and
+# starts the app to check it opens its network ports and WebSocket. It
+# can't test real decks.
+#
+# Run by hand only (Actions, Sequent.app on older macOS, Run workflow).
+name: Sequent.app on older macOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-15-intel, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            tools/check_app.py
+            tools/fixtures
+
+      - name: Which Mac
+        run: |
+          echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) on $(uname -m)"
+
+      # As a visitor gets it: the latest release's disk image, marked as
+      # downloaded from the internet, so Gatekeeper judges it as it would on
+      # their Mac, then the app copied out as the drag into Applications does,
+      # carrying the quarantine as the drag would.
+      - name: Download the release
+        run: |
+          curl -fsSL -o latest.json https://turpin.studio/download/latest.json
+          file=$(python3 -c 'import json; print(json.load(open("latest.json"))["dmg"])')
+          echo "Release: $file"
+          curl -fsSL -o Sequent.dmg "https://turpin.studio/download/$file"
+          xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" Sequent.dmg
+          spctl --assess --type open --context context:primary-signature -vv Sequent.dmg
+          hdiutil attach -nobrowse -readonly -mountpoint mnt Sequent.dmg
+          ditto mnt/Sequent.app Sequent.app
+          hdiutil detach mnt
+          xattr -w com.apple.quarantine "0081;$(printf %x "$(date +%s)");Safari;" Sequent.app
+
+      - name: Gatekeeper accepts it
+        run: |
+          codesign --verify --deep --strict Sequent.app
+          spctl --assess --type execute -vv Sequent.app
+          xcrun stapler validate Sequent.app
+
+      - name: It reads the CDJs as it should
+        run: python3 tools/check_app.py Sequent.app
+
+      # Started for real, on moved ports so nothing on the network is touched,
+      # announcing nothing: it should listen on its Pro DJ Link ports and serve
+      # its WebSocket within a few seconds.
+      - name: It starts and listens
+        run: |
+          SEQUENT_PORT_OFFSET=1000 Sequent.app/Contents/MacOS/Sequent --listen-only > app.log 2>&1 &
+          pid=$!
+          for _ in $(seq 20); do
+            lsof -nP -a -p "$pid" -iTCP:8795 -sTCP:LISTEN >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          lsof -nP -a -p "$pid" -i || true
+          lsof -nP -a -p "$pid" -iUDP:51000 >/dev/null && lsof -nP -a -p "$pid" -iUDP:51001 >/dev/null \
+            || { echo "::error::no Pro DJ Link ports"; cat app.log; exit 1; }
+          lsof -nP -a -p "$pid" -iTCP:8795 -sTCP:LISTEN >/dev/null \
+            || { echo "::error::no WebSocket"; cat app.log; exit 1; }
+          kill "$pid"
+          echo "macOS $(sw_vers -productVersion) on $(uname -m): starts, listens, serves its WebSocket"

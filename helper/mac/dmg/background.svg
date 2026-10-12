@@ -1,0 +1,13 @@
+<!-- The DMG window's background, 600 by 380 points: the app at (150, 190),
+     Applications at (450, 190), and an arrow between them. Rendered to
+     background.png and background@2x.png at 1x and 2x (any browser will
+     do: open it at 600 by 380 and capture it), which are committed so the
+     pipeline needs no renderer. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="380" viewBox="0 0 600 380">
+  <rect width="600" height="380" fill="#f6f6f9"/>
+  <text x="300" y="62" text-anchor="middle" font-family="-apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif" font-size="22" font-weight="700" fill="#17171f">Drag Sequent into Applications</text>
+  <text x="300" y="90" text-anchor="middle" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="14" fill="#6c6c7c">then open it from there, and it follows the CDJs</text>
+  <path d="M232 190 H352" fill="none" stroke="#e0407f" stroke-width="6" stroke-linecap="round"/>
+  <path d="M338 172 L362 190 L338 208" fill="none" stroke="#e0407f" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="300" y="352" text-anchor="middle" font-family="-apple-system, 'SF Pro Text', 'Helvetica Neue', sans-serif" font-size="12" fill="#6c6c7c">turpin.studio</text>
+</svg>

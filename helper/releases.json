@@ -1,0 +1,65 @@
+[
+  {
+    "version": "0.3.2",
+    "date": "2026-10-12",
+    "notes": [
+      "Downloads and update checks now come from the GitHub releases of turpin-studio/sequent, where the code is public under the Eclipse Public License 2.0.",
+      "Lets the studio's apps on turpin.studio subdomains, such as midi.turpin.studio, connect."
+    ]
+  },
+  {
+    "version": "0.3.1",
+    "date": "2026-10-12",
+    "notes": [
+      "Uses next to no power when idle: it no longer redraws its menu-bar icon every second whether or not anything has changed.",
+      "Comes as a disk image only; the zip has gone."
+    ]
+  },
+  {
+    "version": "0.3.0",
+    "date": "2026-10-11",
+    "notes": [
+      "Says in its menu when a newer version is out, with a link to the download page. It asks turpin.studio which version is the latest when it starts and twice a day, and sends nothing about you or your decks.",
+      "Shows its version in the menu bar drop-down, above About Sequent."
+    ]
+  },
+  {
+    "version": "0.2.0",
+    "date": "2026-10-11",
+    "notes": [
+      "Signed and notarised by Apple, so it opens like any downloaded app: no more Privacy and Security, Open Anyway.",
+      "Reads each CDJ-3000X's key, Key Shift included, from the deck itself, so the page follows the key without a rekordbox lookup.",
+      "Shows each CDJ's model and firmware in the page's deck list.",
+      "--capture, run from Terminal, records a deck's status packets when something reads wrong."
+    ]
+  },
+  {
+    "version": "0.1.3",
+    "date": "2026-10-06",
+    "notes": [
+      "About Sequent in the menu, with the version and a credit to Deep Symmetry's DJ Link research.",
+      "Tells the Sequent page its version, shown on the transport's CDJ row."
+    ]
+  },
+  {
+    "version": "0.1.2",
+    "date": "2026-10-06",
+    "notes": [
+      "Credits Deep Symmetry, whose published research it decodes the CDJs with."
+    ]
+  },
+  {
+    "version": "0.1.1",
+    "date": "2026-10-06",
+    "notes": [
+      "Comes as a disk image: open it and drag Sequent into Applications."
+    ]
+  },
+  {
+    "version": "0.1.0",
+    "date": "2026-10-06",
+    "notes": [
+      "First release: a menu-bar app that listens to CDJs over Pro DJ Link and passes their tempo, beats and tracks to the Sequent page."
+    ]
+  }
+]

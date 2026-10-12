@@ -1,0 +1,98 @@
+# The Linux helper (helper/linux): packaged as a .deb, then installed with apt
+# on clean Debian and Ubuntu and run there (tools/check_linux.sh), since the
+# package is built by hand rather than by dpkg-deb. The .deb is kept as a build
+# artifact for 30 days. Nothing here publishes it: an unlinked test build goes
+# to the sequent-downloads bucket by hand. Linux minutes are cheap, but it
+# still runs only when the helper could have changed.
+name: Sequent for Linux
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "helper/linux/**"
+      - "tools/build_deb.py"
+      - "tools/check_app.py"
+      - "tools/check_linux.sh"
+      - "tools/fixtures/**"
+      - ".github/workflows/linux.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the commit count is the development build number
+      - id: build
+        run: |
+          make deb
+          echo "version=0.0.0-dev.$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Sequent-${{ steps.build.outputs.version }}-deb
+          path: build/Sequent-*.deb
+          retention-days: 30
+
+  install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:bookworm", "debian:trixie", "ubuntu:24.04"]
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: Sequent-${{ needs.build.outputs.version }}-deb
+      - name: Install it as anyone would
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq ./Sequent-*.deb xvfb xauth dbus dbus-x11 > /dev/null
+          dpkg -s sequent | grep -E '^(Status|Version)'
+          dpkg -L sequent
+      - run: tools/check_linux.sh
+
+  # The service, on the runner itself, since the containers have no systemd:
+  # installed it's off; enabled it starts as its throwaway user under the
+  # unit's restrictions and listens; removing the package stops it.
+  service:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Sequent-${{ needs.build.outputs.version }}-deb
+      - name: Installed, it's off
+        run: |
+          sudo apt-get install -y -qq ./Sequent-*.deb > /dev/null
+          systemd-analyze verify /usr/lib/systemd/system/sequent.service
+          ! systemctl is-active --quiet sequent
+          ! systemctl is-enabled --quiet sequent
+      - name: Enabled, it runs and listens
+        run: |
+          sudo systemctl enable --now sequent
+          for _ in $(seq 20); do ss -ltn | grep -q '127.0.0.1:8795 ' && break; sleep 0.5; done
+          systemctl status sequent --no-pager
+          ss -lun | grep -q ':50001 ' && ss -lun | grep -q ':50002 '
+          ss -ltn | grep -q '127.0.0.1:8795 '
+          ps -o user= -C sequent -C python3 | grep -v root
+          ! journalctl -u sequent --no-pager | grep -q Traceback
+          systemd-analyze security sequent --no-pager | tail -1
+      - name: Removed, it stops
+        run: |
+          sudo apt-get remove -y -qq sequent > /dev/null
+          ! systemctl is-active --quiet sequent

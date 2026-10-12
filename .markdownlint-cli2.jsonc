@@ -1,0 +1,8 @@
+// Markdown lint: lines of prose at most 80 characters, as everywhere here.
+// Code blocks and tables are exempt, since a JSON example or a table row
+// can't be wrapped without breaking it.
+{
+  "config": {
+    "MD013": { "code_blocks": false, "tables": false }
+  }
+}

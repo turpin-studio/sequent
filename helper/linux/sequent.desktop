@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sequent
+GenericName=CDJ connection
+Comment=Connects the Sequent page at turpin.studio to Pioneer CDJs over Pro DJ Link
+Exec=sequent
+Icon=sequent
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=DJ;CDJ;Pro DJ Link;rekordbox;tempo;
+StartupNotify=false

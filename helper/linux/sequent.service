@@ -1,0 +1,31 @@
+# Sequent as a system service: headless, from boot, with no one logged in.
+# Off by default, since it holds the same ports as the tray icon would:
+#   sudo systemctl enable --now sequent
+# Its log: journalctl -u sequent -f
+[Unit]
+Description=Sequent, the CDJs' Pro DJ Link connection for the Sequent page
+Documentation=https://turpin.studio/
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/sequent --headless
+Restart=on-failure
+RestartSec=5
+# A throwaway user with nothing to write and nothing to see: the ports are all
+# above 1024, and announcing on each USB link needs no privilege on Linux 5.7
+# and later.
+DynamicUser=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# IPv4 for the decks and the page, netlink for `ip addr` to find the links.
+RestrictAddressFamilies=AF_INET AF_NETLINK AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
